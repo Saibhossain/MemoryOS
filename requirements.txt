@@ -1,7 +1,12 @@
 langgraph 
 langchain 
+langchain-core
 langchain-ollama 
 langgraph-checkpoint-postgres 
 psycopg[binary,pool]
 psycopg[binary] 
 python-dotenv
+streamlit
+pandas
+plotly
+Pillow
