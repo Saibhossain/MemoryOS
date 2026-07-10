@@ -1,165 +1,204 @@
-import os
-import sys
-import uuid
-import streamlit as st
+"""
+Chatbot/app.py
 
-# Ensure proper path routing from project root
+Full chatbot UI:
+  - New chat / delete chat / rename chat (sidebar)
+  - Persistent conversation memory via LangGraph + PostgresSaver
+  - Image upload (multimodal message, if your Ollama model supports vision)
+  - Edit-last-message + regenerate (rewinds and re-invokes the graph)
+
+Run with:
+    streamlit run Chatbot/app.py
+"""
+import sys
+import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from langchain_core.messages import AIMessage, HumanMessage
-from Chatbot.graph import app
-from Chatbot.utils import build_human_message, message_has_image, message_text
-from DB.connection import get_pool, get_conn_string
-from langgraph.checkpoint.postgres import PostgresSaver
+import streamlit as st
 
-st.set_page_config(page_title="MemoryOS - Chat Interface", layout="wide", page_icon="🧠")
-pool = get_pool()
+from DB.chat_sessions import (
+    init_chat_sessions_table,
+    create_chat,
+    list_chats,
+    rename_chat,
+    delete_chat,
+    touch_chat,
+    get_chat_title,
+)
+from Chatbot.graph import build_graph, regenerate_from_edit
+from Chatbot.utils import build_human_message, message_text, message_has_image
 
-# ---------------------------------------------------------------------
-# Session Metadata Synchronization Helpers
-# ---------------------------------------------------------------------
-def sync_chat_session(thread_id: str, title: str, message_count: int):
-    """Upserts tracking logs to the chat_sessions dashboard index table."""
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO chat_sessions (thread_id, title, message_count, updated_at)
-                VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
-                ON CONFLICT (thread_id) DO UPDATE SET
-                    message_count = EXCLUDED.message_count,
-                    updated_at = CURRENT_TIMESTAMP;
-            """, (thread_id, title[:50], message_count))
-
-def purge_chat_session(thread_id: str):
-    """Removes records from application index and systemic checkpointer tables."""
-    # 1. Clear application session indexes
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM chat_sessions WHERE thread_id = %s;", (thread_id,))
-            
-    # 2. Clear core LangGraph internal snapshots for this thread execution
-    with PostgresSaver.from_conn_string(get_conn_string()) as cp:
-        cp.delete_thread(thread_id)
-
-def fetch_all_sessions():
-    """Retrieves list of existing active sessions for side panel navigation."""
-    try:
-        with pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT thread_id, title FROM chat_sessions ORDER BY updated_at DESC;")
-                return cur.fetchall()
-    except Exception:
-        return []
+st.set_page_config(page_title="MemoryOS Chatbot", layout="wide")
 
 # ---------------------------------------------------------------------
-# Sidebar Panel Layout
+# One-time setup (idempotent) + cached, long-lived resources
 # ---------------------------------------------------------------------
-st.sidebar.title("🧠 Agentic Memory OS")
-st.sidebar.subheader("Phase 1: Short-Term Thread State")
+init_chat_sessions_table()
 
-# Select/Load Thread Sessions
-existing_chats = fetch_all_sessions()
-chat_options = {f"✨ {title} ({tid[:6]})": tid for tid, title in existing_chats}
 
-if "thread_id" not in st.session_state:
-    if chat_options:
-        st.session_state.thread_id = list(chat_options.values())[0]
+@st.cache_resource
+def get_graph():
+    """Built once per Streamlit server process, not once per rerun -
+    otherwise we'd open a new Postgres connection on every button click."""
+    return build_graph()
+
+
+graph = get_graph()
+
+# ---------------------------------------------------------------------
+# Session state: which chat is currently open
+# ---------------------------------------------------------------------
+if "active_thread_id" not in st.session_state:
+    chats = list_chats()
+    if chats:
+        st.session_state.active_thread_id = chats[0][0]
     else:
-        st.session_state.thread_id = str(uuid.uuid4())
+        st.session_state.active_thread_id = create_chat("New Chat")
 
-# Session Operations
-col_new, col_del = st.sidebar.columns(2)
-with col_new:
+if "renaming_thread_id" not in st.session_state:
+    st.session_state.renaming_thread_id = None
+
+if "editing_last_message" not in st.session_state:
+    st.session_state.editing_last_message = False
+
+
+# ---------------------------------------------------------------------
+# Sidebar: chat list + new/delete/rename controls
+# ---------------------------------------------------------------------
+with st.sidebar:
+    st.title("💬 Chats")
+
     if st.button("➕ New Chat", use_container_width=True):
-        st.session_state.thread_id = str(uuid.uuid4())
+        new_id = create_chat("New Chat")
+        st.session_state.active_thread_id = new_id
+        st.session_state.editing_last_message = False
         st.rerun()
 
-with col_del:
-    if st.button("🗑️ Delete Chat", use_container_width=True):
-        purge_chat_session(st.session_state.thread_id)
-        st.session_state.thread_id = str(uuid.uuid4())
-        st.sidebar.success("Database records dropped.")
-        st.rerun()
+    st.divider()
 
-# Workspace Selector Dropdown
-if chat_options:
-    selected_name = st.sidebar.selectbox(
-        "Active Conversations",
-        options=list(chat_options.keys()),
-        index=list(chat_options.values()).index(st.session_state.thread_id) if st.session_state.thread_id in chat_options.values() else 0
-    )
-    if chat_options[selected_name] != st.session_state.thread_id:
-        st.session_state.thread_id = chat_options[selected_name]
-        st.rerun()
+    for thread_id, title, created_at, updated_at, message_count in list_chats():
+        is_active = thread_id == st.session_state.active_thread_id
+        row = st.container()
 
-st.sidebar.divider()
-uploaded_image = st.sidebar.file_uploader("Multimodal Vision Input", type=["png", "jpg", "jpeg"])
-
-# ---------------------------------------------------------------------
-# Thread State Processing Engine
-# ---------------------------------------------------------------------
-config = {"configurable": {"thread_id": st.session_state.thread_id}}
-
-# Fetch the existing persistent message stack from PostgreSQL
-try:
-    current_state = app.get_state(config)
-    messages = current_state.values.get("messages", [])
-except Exception:
-    messages = []
-
-st.title("🗪 Local Agent Core")
-st.caption(f"Connected to thread checkpoint tracking: `{st.session_state.thread_id}`")
-
-# Render historical conversation elements
-for idx, msg in enumerate(messages):
-    if isinstance(msg, HumanMessage):
-        with st.chat_message("user"):
-            st.write(message_text(msg))
-            if message_has_image(msg):
-                st.caption("🖼️ *Attached Multimodal Context Payload stored in `checkpoint_blobs`*")
-            
-            # Message State Editing Engine
-            with st.expander("✏️ Edit this checkpoint position"):
-                edit_input = st.text_input("Modify text prompt:", value=message_text(msg), key=f"inp_{msg.id or idx}")
-                if st.button("Fork State Flow Here", key=f"btn_{msg.id or idx}"):
-                    # Write modified payload directly targeting historical ID node pathing
-                    updated_msg = HumanMessage(content=edit_input, id=msg.id)
-                    app.update_state(config, {"messages": [updated_msg]}, as_node="chatbot")
-                    st.success("Graph execution path shifted successfully.")
+        with row:
+            if st.session_state.renaming_thread_id == thread_id:
+                new_title = st.text_input(
+                    "Rename", value=title, key=f"rename_input_{thread_id}",
+                    label_visibility="collapsed",
+                )
+                c1, c2 = st.columns(2)
+                if c1.button("Save", key=f"save_{thread_id}", use_container_width=True):
+                    rename_chat(thread_id, new_title.strip() or "Untitled")
+                    st.session_state.renaming_thread_id = None
                     st.rerun()
-                    
-    elif isinstance(msg, AIMessage):
-        with st.chat_message("assistant"):
-            st.write(msg.content)
+                if c2.button("Cancel", key=f"cancel_{thread_id}", use_container_width=True):
+                    st.session_state.renaming_thread_id = None
+                    st.rerun()
+            else:
+                cols = st.columns([5, 1, 1])
+                if cols[0].button(
+                    f"{'🟢 ' if is_active else ''}{title}  ·  {message_count} msgs",
+                    key=f"open_{thread_id}",
+                    use_container_width=True,
+                ):
+                    st.session_state.active_thread_id = thread_id
+                    st.session_state.editing_last_message = False
+                    st.rerun()
+                if cols[1].button("✏️", key=f"edit_{thread_id}"):
+                    st.session_state.renaming_thread_id = thread_id
+                    st.rerun()
+                if cols[2].button("🗑️", key=f"del_{thread_id}"):
+                    delete_chat(thread_id)
+                    if st.session_state.active_thread_id == thread_id:
+                        remaining = list_chats()
+                        st.session_state.active_thread_id = (
+                            remaining[0][0] if remaining else create_chat("New Chat")
+                        )
+                    st.rerun()
 
-# Process incoming stream events
-if prompt_input := st.chat_input("Enter message sequence context..."):
+    st.divider()
+    st.caption(
+        "Memory is stored in Postgres via LangGraph's PostgresSaver, "
+        "keyed by thread_id. Open the DB monitor app to watch it live."
+    )
+
+
+# ---------------------------------------------------------------------
+# Main chat area
+# ---------------------------------------------------------------------
+active_thread_id = st.session_state.active_thread_id
+config = {"configurable": {"thread_id": active_thread_id}}
+
+st.title(get_chat_title(active_thread_id))
+
+state = graph.get_state(config)
+messages = state.values.get("messages", [])
+
+for i, msg in enumerate(messages):
+    role = "user" if msg.type == "human" else "assistant"
+    with st.chat_message(role):
+        st.write(message_text(msg))
+        if message_has_image(msg):
+            st.caption("🖼️ image attached")
+
+# Edit-last-message control (only offered if there's at least one human turn)
+last_human_msg = next((m for m in reversed(messages) if m.type == "human"), None)
+
+if last_human_msg is not None:
+    with st.expander("✏️ Edit last message & regenerate"):
+        edited_text = st.text_area(
+            "Edit your last message",
+            value=message_text(last_human_msg),
+            key="edit_box",
+        )
+        if st.button("Regenerate response"):
+            new_msg = build_human_message(edited_text, uploaded_image=None)
+            with st.spinner("Regenerating..."):
+                regenerate_from_edit(graph, config, new_msg)
+            new_state = graph.get_state(config)
+            touch_chat(active_thread_id, len(new_state.values.get("messages", [])))
+            st.rerun()
+
+st.divider()
+
+# ---------------------------------------------------------------------
+# Input row: text + optional image
+# ---------------------------------------------------------------------
+uploaded_image = st.file_uploader(
+    "Attach an image (optional - only used if your Ollama model supports vision)",
+    type=["png", "jpg", "jpeg", "webp"],
+    key=f"uploader_{active_thread_id}",
+)
+
+user_text = st.chat_input("Type your message...")
+
+if user_text is not None:
+    human_msg = build_human_message(user_text, uploaded_image)
+
     with st.chat_message("user"):
-        st.write(prompt_input)
-        
-    # Standardize structure via utilities wrapper
-    formatted_msg = build_human_message(prompt_input, uploaded_image)
-    
+        st.write(user_text)
+        if uploaded_image is not None:
+            st.image(uploaded_image, width=200)
+
     with st.chat_message("assistant"):
-        with st.spinner("Invoking local graph computation nodes..."):
-            # Execute pipeline and stream tracking states downstream inside postgres
-            output = app.invoke({"messages": [formatted_msg]}, config=config)
-            ai_response = output["messages"][-1].content
-            st.write(ai_response)
-            
-    # Calculate metadata details to refresh the monitoring application layout indexes
-    updated_messages = output.get("messages", [])
-    inferred_title = prompt_input if len(prompt_input) < 45 else f"{prompt_input[:42]}..."
-    if len(updated_messages) > 2:
-        # Keep title static based on initial prompt context if it exists
-        try:
-            with pool.connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT title FROM chat_sessions WHERE thread_id = %s;", (st.session_state.thread_id,))
-                    res = cur.fetchone()
-                    if res: inferred_title = res[0]
-        except Exception:
-            pass
-            
-    sync_chat_session(st.session_state.thread_id, inferred_title, len(updated_messages))
+        with st.spinner("Thinking..."):
+            try:
+                result = graph.invoke({"messages": [human_msg]}, config)
+                reply = result["messages"][-1]
+                st.write(message_text(reply))
+            except Exception as e:
+                st.error(
+                    f"Model call failed: {e}\n\n"
+                    "If you attached an image, your Ollama model may not "
+                    "support vision. Try a vision model such as "
+                    "`qwen2.5vl` or `llava`, or resend without the image."
+                )
+
+    # If this was the first message, auto-title the chat from it
+    if len(messages) == 0:
+        auto_title = user_text.strip()[:40] or "New Chat"
+        rename_chat(active_thread_id, auto_title)
+
+    new_state = graph.get_state(config)
+    touch_chat(active_thread_id, len(new_state.values.get("messages", [])))
     st.rerun()

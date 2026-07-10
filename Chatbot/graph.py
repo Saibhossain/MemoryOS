@@ -1,63 +1,87 @@
+"""
+Chatbot/graph.py
+
+The actual LangGraph definition: one node that calls a local Ollama model.
+Conversation state (the message list) is persisted via PostgresSaver,
+keyed by thread_id - this is "Phase 1: short-term / thread-scoped memory".
+
+No RAG, no embeddings, no long-term store here on purpose - this file is
+meant to teach the checkpointer mechanism in isolation.
+"""
 import os
-import sys
-from typing import Annotated, Sequence, TypedDict
+from dotenv import load_dotenv
+from psycopg import Connection
 
-# Ensure proper path routing from project root
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-from langchain_core.messages import BaseMessage
-from langchain_ollama import ChatOllama
+from langgraph.graph import StateGraph, MessagesState, START
 from langgraph.checkpoint.postgres import PostgresSaver
-from langgraph.graph import START, END, StateGraph
-from langgraph.graph.message import add_messages
-from DB.connection import get_conn_string, get_pool
+from langchain_ollama import ChatOllama
+from langchain_core.messages import RemoveMessage
 
-# 1. State Definition
-class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], add_messages]
+from DB.connection import get_conn_string
 
-# 2. Node Execution Block
-# Note: Ensure you have pulled the model locally via: ollama pull qwen2.5
-llm = ChatOllama(model="qwen3:1.7b", temperature=0.7)
+load_dotenv()
 
-def chatbot_node(state: AgentState):
-    """Executes the local model using the structural message state history."""
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:1b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+
+llm = ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.4)
+
+
+def call_model(state: MessagesState):
+    """The only node in this graph: send the full message history to the
+    model and append its reply. LangGraph's `add_messages` reducer (built
+    into MessagesState) takes care of appending rather than overwriting."""
     response = llm.invoke(state["messages"])
     return {"messages": [response]}
 
-# 3. Graph Assembly
-workflow = StateGraph(AgentState)
-workflow.add_node("chatbot", chatbot_node)
-workflow.add_edge(START, "chatbot")
-workflow.add_edge("chatbot", END)
 
-# 4. Persistence Initialization & Compiling
-DB_URL = get_conn_string()
+def build_graph():
+    """
+    Builds and compiles the graph with a live PostgresSaver checkpointer.
 
-# Ensure the core LangGraph tables and app metadata tables exist
-def init_database_tables():
-    # Setup underlying LangGraph storage schemas
-    with PostgresSaver.from_conn_string(DB_URL) as checkpointer:
-        checkpointer.setup()
-        
-    # Setup the application-level 'chat_sessions' table required by the monitor
-    pool = get_pool()
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS chat_sessions (
-                    thread_id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    message_count INT DEFAULT 0
-                );
-            """)
+    Note: PostgresSaver.from_conn_string(...) in the LangGraph docs is
+    shown as a context manager (`with ... as checkpointer:`), which closes
+    the connection when the block exits. That's wrong for a long-running
+    Streamlit app - we want the connection to stay open for the app's
+    lifetime, so we open a plain psycopg Connection ourselves and hand it
+    to PostgresSaver directly. Table creation (`.setup()`) is handled once,
+    separately, in init_db.py - not here, so we don't re-run migrations on
+    every Streamlit rerun.
+    """
+    builder = StateGraph(MessagesState)
+    builder.add_node("model", call_model)
+    builder.add_edge(START, "model")
 
-init_database_tables()
+    conn = Connection.connect(get_conn_string(), autocommit=True)
+    checkpointer = PostgresSaver(conn)
 
-# Compile graph using the Postgres persistence architecture
-# Compile graph using the Postgres persistence architecture via your active pool
-pool = get_pool()
-checkpointer = PostgresSaver(pool)
-app = workflow.compile(checkpointer=checkpointer)
+    return builder.compile(checkpointer=checkpointer)
+
+
+def regenerate_from_edit(graph, config, new_human_message):
+    """
+    Implements "edit last message and regenerate".
+
+    LangGraph's checkpointer is a version chain (each turn is a new
+    checkpoint pointing at the previous one - see `parent_checkpoint_id`
+    in the `checkpoints` table). To edit history, we don't rewrite old
+    rows; instead we tell the *current* state to drop the last human
+    turn and its reply using RemoveMessage (a special reducer signal
+    understood by MessagesState's add_messages function), then invoke a
+    fresh turn on top. This creates new checkpoints - the old ones are
+    still there in the table if you ever want to inspect the chain.
+    """
+    state = graph.get_state(config)
+    messages = state.values.get("messages", [])
+
+    last_human_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].type == "human":
+            last_human_idx = i
+            break
+
+    if last_human_idx is not None:
+        removals = [RemoveMessage(id=m.id) for m in messages[last_human_idx:]]
+        graph.update_state(config, {"messages": removals})
+
+    return graph.invoke({"messages": [new_human_message]}, config)
