@@ -28,6 +28,22 @@ separation is the single most important idea in Phase 1.
 
 ## 2. File-by-file walkthrough
 
+```bash
+MemoryOS/
+├── .env
+├── init_db.py
+├── DB/
+│   ├── __init__.py
+│   ├── connection.py
+│   ├── chat_sessions.py
+│   └── monitor_app.py
+└── Chatbot/
+    ├── __init__.py
+    ├── graph.py
+    ├── utils.py
+    └── app.py
+```
+
 ### `DB/connection.py` — one shared connection pool
 
 ```python
