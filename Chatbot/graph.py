@@ -14,23 +14,30 @@ Graph shape:
                             |
                             +--> END   (if not triggered)
 
-State now carries a `summary` field alongside `messages`. Both are
-persisted in the same Postgres checkpoint - no new tables needed, this
-is just one more key in the same JSONB/blob LangGraph already writes.
+summarize_node no longer deletes messages from state. Full history
+stays in the checkpoint and the UI forever, exactly like Phase 1.
+The running summary now lives in a separate `summary_context` table
+(DB/summary_context.py). call_model reads that table to decide what
+to actually send the LLM - bounded input, unbounded storage.
+
 
 No RAG, no embeddings, no long-term store here on purpose - this file is
 meant to teach the checkpointer mechanism in isolation.
 """
 import os
+import base64
 from dotenv import load_dotenv
 from psycopg import Connection
 
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.checkpoint.postgres import PostgresSaver
 from langchain_ollama import ChatOllama
-from langchain_core.messages import RemoveMessage, SystemMessage
+from langchain_core.messages import RemoveMessage, SystemMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
+
 
 from DB.connection import get_conn_string
+from DB.summary_context import get_summary_context, upsert_summary_context
 
 load_dotenv()
 
@@ -43,84 +50,117 @@ TOKEN_THRESHOLD = 3000  # If the message history exceeds this many tokens, summa
 MESSAGE_COUNT_FALLBACK = 20 # If we can't get a token count, fall back to this many messages
 KEEP_LAST_N = 6
 
-class State(MessagesState):
-    """
-    Subclass of MessagesState that adds a `summary` field to the state.
-    This is a simple string, not a list of messages, because we don't
-    need to preserve the model's summary turn as a message in the history.
-    """
-    summary: str
+State = MessagesState  # no extra state field needed anymore - summary
+                        # lives in Postgres, not in the checkpoint state
 
 def estimate_tokens(messages) -> int:
     total_chars = 0
     for m in messages:
-        if isinstance(m.countent, str):
+        if isinstance(m.content, str):
             total_chars += len(m.content)
-        else:
-            for block in m.content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    total_chars += len(block["text"])
-    return total_chars // 4  # Roughly 4 chars per token
+
+    return total_chars // 4 # Roughly 4 chars per token
+
+def describe_image(image_bytes: bytes, mime: str = "image/png") -> str:
+    """
+    One-off vision call, deliberately NOT a graph node - it runs before a
+    HumanMessage is even constructed, so its output (text) is what gets
+    persisted, never the image itself.
+
+    Requires a vision-capable Ollama model (qwen2.5vl, llava, etc). If
+    OLLAMA_MODEL is text-only, this will raise - the caller (app.py)
+    should catch that and fall back gracefully.
+    """
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    vision_message = HumanMessage(
+        content=[
+            {
+                "type": "text",
+                "text": (
+                    "Describe this image in detail: objects, people, text "
+                    "visible in it, colors, and overall context. Be "
+                    "concise but thorough - this description will replace "
+                    "the image in a text-only conversation log."
+                ),
+            },
+            {"type": "image_url", "image_url": f"data:{mime};base64,{b64}"},
+        ]
+    )
+    response = llm.invoke([vision_message])
+    return response.content
 
 
+def call_model(state: State, config: RunnableConfig):
+    """
+    Sends the model only the unsummarized tail of the conversation plus
+    the running summary (if any) - both pulled from Postgres, not from
+    graph state. `messages` in state itself is always the FULL history;
+    we just don't send all of it to the LLM every turn.
+    """
+    thread_id = config["configurable"]["thread_id"]
+    summary, summarized_count = get_summary_context(thread_id)
 
-def call_model(state: State):
-    """The main chat turn. If a summary already exists, it's prepended as
-    a SystemMessage so the model keeps continuity even though the raw
-    messages it's summarizing have been pruned out of state."""
-    messages = state["messages"]
-    summary = state.get("summary","")
+    all_messages = state["messages"]
+    tail_messages = all_messages[summarized_count:]
 
     if summary:
         system_msg = SystemMessage(
             content=(
-             "Here is a summary of the earlier part of this conversation"
-             f"that is no longer shown verbatim:\n\n{summary}\n\n"
-             "Use it for context, but respond only to the most recent message."
-             
+                "Here is a summary of earlier parts of this conversation:\n\n"
+                f"{summary}\n\n"
+                "Use it for context, but respond only to the most recent message."
             )
         )
-        models_input = [system_msg] + messages
+        model_input = [system_msg] + tail_messages
     else:
-        models_input = messages
+        model_input = tail_messages
 
-    response = llm.invoke(models_input)
+    response = llm.invoke(model_input)
     return {"messages": [response]}
 
 
 
 
-def should_summarize(state: State) -> str:
-    """Conditional edge: decide whether to route to summarize_node or END."""
-    messages = state["messages"]
-    if len(messages)<=KEEP_LAST_N:
-        return END  # Don't summarize if we have only a few messages
-    
-    token_count = estimate_tokens(messages)
-    if token_count > TOKEN_THRESHOLD or len(messages) > MESSAGE_COUNT_FALLBACK:
+def should_summarize(state: State, config: RunnableConfig) -> str:
+    """Looks only at the *unsummarized tail* (not the whole history) to
+    decide whether there's enough new material to fold into the summary."""
+    thread_id = config["configurable"]["thread_id"]
+    _, summarized_count = get_summary_context(thread_id)
+
+    unsummarized = state["messages"][summarized_count:]
+    if len(unsummarized) <= KEEP_LAST_N:
+        return END
+
+    foldable = unsummarized[:-KEEP_LAST_N]
+    if not foldable:
+        return END
+
+    token_count = estimate_tokens(foldable)
+    if token_count > TOKEN_THRESHOLD or len(unsummarized) > MESSAGE_COUNT_FALLBACK:
         return "summarize"
-    
+
     return END
 
 
-def summarize_node(state: State):
-    """Folds everything older than the last KEEP_LAST_N messages into a
-    running summary, then removes those older messages from state using
-    RemoveMessage - the same mechanic Phase 1 used for edit/regenerate.
+def summarize_node(state: State, config: RunnableConfig):
+    """
+    Folds newly-eligible older messages into the running summary and
+    advances `summarized_count` in Postgres. Does NOT touch `messages` in
+    state - nothing is ever removed from the checkpoint or the UI.
+    """
+    thread_id = config["configurable"]["thread_id"]
+    existing_summary, summarized_count = get_summary_context(thread_id)
 
-    Nothing is lost from Postgres: the full history is still sitting in
-    older checkpoint rows (parent_checkpoint_id chain). We're only
-    pruning what gets carried forward in *current* state."""
-    messages = state["messages"]
-    existing_summary = state.get("summary", "")
+    all_messages = state["messages"]
+    unsummarized = all_messages[summarized_count:]
+    foldable = unsummarized[:-KEEP_LAST_N]
 
-    older_messages = messages[:-KEEP_LAST_N]
-    if not older_messages:
-        return{}
-    
+    if not foldable:
+        return {}
+
     conversation_text = "\n".join(
-        f"{m.type.upper()}:{m.content if isinstance(m.content,str) else '[message with image]'}"
-        for m in older_messages
+        f"{m.type.upper()}: {m.content if isinstance(m.content, str) else '[non-text content]'}"
+        for m in foldable
     )
 
     if existing_summary:
@@ -140,11 +180,12 @@ def summarize_node(state: State):
             "Return only the summary text, nothing else."
         )
 
-    summary_response = llm.invoke(prompt)
-    new_summary = summary_response.content
-    removals = [RemoveMessage(id=m.id) for m in older_messages]
+    new_summary = llm.invoke(prompt).content
+    new_summarized_count = summarized_count + len(foldable)
 
-    return {"summary": new_summary, "messages": removals}
+    upsert_summary_context(thread_id, new_summary, new_summarized_count)
+
+    return {}  # state itself is untouched - messages stay complete
 
 
 
@@ -157,7 +198,7 @@ def build_graph():
     `with ... as checkpointer:` pattern from LangGraph's docs, which
     would close it immediately - wrong for a long-running Streamlit app.
     """
-    builder = StateGraph(MessagesState)
+    builder = StateGraph(State)
     builder.add_node("model", call_model)
     builder.add_node("summarize", summarize_node)
 
@@ -175,20 +216,18 @@ def build_graph():
     app = builder.compile(checkpointer=checkpointer)
     try:
         png_bytes = app.get_graph().draw_mermaid_png()
-        with open("img/Phase2_graph.png", "wb") as f:
+        with open("img/Phase3_graph.png", "wb") as f:
             f.write(png_bytes)
     except Exception as e:
         print(f"Error occurred while generating graph: {e}")
 
     return app
 
+
 def regenerate_from_edit(graph, config, new_human_message):
-    """
-    Implements "edit last message and regenerate" (unchanged mechanic
-    from Phase 1). Note this only removes/replaces the last human turn -
-    it does not touch `summary`, so an edit doesn't undo prior
-    summarization, only the most recent exchange.
-    """
+    """Edit-last-message mechanic, unchanged from before. This still uses
+    RemoveMessage - that's fine, it's an intentional user-initiated edit
+    of the most recent turn, not automatic history pruning."""
     state = graph.get_state(config)
     messages = state.values.get("messages", [])
 
