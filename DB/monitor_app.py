@@ -1,9 +1,11 @@
 """
-DB/monitor_app.py
+DB/monitor_app.py  (Phase 2)
 
 A read-only Streamlit dashboard for watching what LangGraph + your chatbot
 are actually doing to Postgres: table sizes, row counts, per-thread state
-growth, live connections, and a raw SQL browser.
+growth, live connections, a raw SQL browser, and - new in Phase 2 - a
+decoded view of each thread's summary field and effective vs. raw message
+counts.
 
 Run with:
     streamlit run DB/monitor_app.py
@@ -17,10 +19,21 @@ import plotly.express as px
 import streamlit as st
 
 from DB.connection import get_pool
+from Chatbot.graph import build_graph
 
 st.set_page_config(page_title="MemoryOS - DB Monitor", layout="wide")
 
 pool = get_pool()
+
+
+@st.cache_resource
+def get_graph():
+    """Same cached-resource pattern as Chatbot/app.py - one connection for
+    the life of this Streamlit process, not one per rerun."""
+    return build_graph()
+
+
+graph = get_graph()
 
 
 def run_query(sql: str, params=None) -> pd.DataFrame:
@@ -144,7 +157,78 @@ except Exception as e:
     st.warning(f"checkpoints table not available yet: {e}")
 
 # ---------------------------------------------------------------------
-# 5. Long-term memory store browser (Phase 3, empty until you build it)
+# 5. NEW in Phase 2 - decoded memory state per thread
+# ---------------------------------------------------------------------
+st.header("Decoded memory state per thread (Phase 2)")
+st.caption(
+    "The `summary` field lives inside the serialized checkpoint blob, not "
+    "as its own SQL column - so raw SQL can't read it directly. This "
+    "section uses the same PostgresSaver checkpointer the chatbot uses to "
+    "decode real state, showing you the gap between 'how many messages "
+    "ever existed' and 'how many the model actually sees on the next turn'."
+)
+
+try:
+    chats = run_query(
+        "SELECT thread_id, title, message_count FROM chat_sessions ORDER BY updated_at DESC;"
+    )
+
+    rows = []
+    for _, row in chats.iterrows():
+        thread_id = row["thread_id"]
+        config = {"configurable": {"thread_id": thread_id}}
+        state = graph.get_state(config)
+
+        effective_messages = state.values.get("messages", [])
+        summary = state.values.get("summary", "")
+
+        rows.append(
+            {
+                "title": row["title"],
+                "thread_id": thread_id,
+                "raw_message_count (chat_sessions)": row["message_count"],
+                "effective_message_count (sent to model)": len(effective_messages),
+                "has_summary": bool(summary),
+                "summary_chars": len(summary) if summary else 0,
+            }
+        )
+
+    decoded_df = pd.DataFrame(rows)
+    if not decoded_df.empty:
+        st.dataframe(decoded_df, use_container_width=True, hide_index=True)
+
+        summarized_threads = decoded_df[decoded_df["has_summary"]]
+        if not summarized_threads.empty:
+            st.subheader("Read a thread's actual summary text")
+            selected_title = st.selectbox(
+                "Choose a summarized thread",
+                summarized_threads["title"].tolist(),
+            )
+            selected_row = summarized_threads[
+                summarized_threads["title"] == selected_title
+            ].iloc[0]
+            selected_config = {
+                "configurable": {"thread_id": selected_row["thread_id"]}
+            }
+            selected_state = graph.get_state(selected_config)
+            st.text_area(
+                "Summary content",
+                value=selected_state.values.get("summary", ""),
+                height=200,
+                disabled=True,
+            )
+        else:
+            st.info(
+                "No thread has triggered summarization yet. Send enough "
+                "messages in one chat to cross the token/message threshold."
+            )
+    else:
+        st.info("No chats yet.")
+except Exception as e:
+    st.warning(f"Could not decode thread state: {e}")
+
+# ---------------------------------------------------------------------
+# 6. Long-term memory store browser (Phase 3, empty until you build it)
 # ---------------------------------------------------------------------
 st.header("Long-term memory (store table)")
 
@@ -165,7 +249,7 @@ except Exception as e:
     st.warning(f"store table not available yet: {e}")
 
 # ---------------------------------------------------------------------
-# 6. Live activity
+# 7. Live activity
 # ---------------------------------------------------------------------
 st.header("Live connections (pg_stat_activity)")
 
@@ -180,7 +264,7 @@ activity_df = run_query(
 st.dataframe(activity_df, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------------------
-# 7. Raw SQL browser (read-only)
+# 8. Raw SQL browser (read-only)
 # ---------------------------------------------------------------------
 st.header("Run a read-only SQL query")
 st.caption("Only SELECT statements are allowed here, as a safety guard.")

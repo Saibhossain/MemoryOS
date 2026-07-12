@@ -9,7 +9,6 @@ LangGraph's own tables (checkpoints, checkpoint_blobs, checkpoint_writes)
 and gives the Streamlit sidebar something to list, rename, and delete.
 """
 import uuid
-
 from DB.connection import get_pool
 
 
@@ -102,4 +101,5 @@ def delete_chat(thread_id: str):
         conn.execute("DELETE FROM checkpoint_writes WHERE thread_id = %s", (thread_id,))
         conn.execute("DELETE FROM checkpoint_blobs WHERE thread_id = %s", (thread_id,))
         conn.execute("DELETE FROM checkpoints WHERE thread_id = %s", (thread_id,))
+        conn.execute("DELETE FROM summary_context WHERE thread_id = %s", (thread_id,))
         conn.execute("DELETE FROM chat_sessions WHERE thread_id = %s", (thread_id,))
