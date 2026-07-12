@@ -18,7 +18,7 @@ Phase 2 is about the engineering trade-off between:
 - **Checkpointer memory** (full fidelity, replayable, already built in Phase 1)
 - **What actually gets sent to the model** on each turn (must be bounded)
 
-![Phase 2 Graph](./img/Phase2_graph.png)
+![Phase 2 Graph](/img/Phase2_graph.png)
 
 The diagram above is the actual shape of the Phase 2 graph: `model` runs
 every turn, a conditional edge decides whether enough new material has
