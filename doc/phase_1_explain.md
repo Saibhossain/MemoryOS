@@ -1,6 +1,6 @@
 # Phase 1 — Short-Term Memory (Explained)
 
-![Phase 2 Graph](img/Phase1_graph.png)
+![Phase 1 Graph](img\Phase1_graph.png)
 
 **Goal of Phase 1:** build a fully working local chatbot (Ollama + Qwen) whose
 conversation memory lives in Postgres instead of RAM, using LangGraph's
