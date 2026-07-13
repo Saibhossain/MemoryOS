@@ -32,10 +32,12 @@ from psycopg import Connection
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.checkpoint.postgres import PostgresSaver
 from langchain_ollama import ChatOllama
-from langchain_core.messages import RemoveMessage, SystemMessage, HumanMessage
+from langchain_core.messages import RemoveMessage, SystemMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 
+from Chatbot.memory_tools import build_memory_tools, notes_as_context_with_ids
 
+from DB.profiles import DEFAULT_PROFILE_ID
 from DB.connection import get_conn_string
 from DB.summary_context import get_summary_context, upsert_summary_context
 
@@ -96,29 +98,76 @@ def call_model(state: State, config: RunnableConfig):
     the running summary (if any) - both pulled from Postgres, not from
     graph state. `messages` in state itself is always the FULL history;
     we just don't send all of it to the LLM every turn.
+
+    Phase 3 long-term memory notes for the active profile. Tools are
+    rebuilt and rebound every call so profile-switching mid-session works
+    correctly - see Chatbot/memory_tools.py for why.
     """
     thread_id = config["configurable"]["thread_id"]
+    profile_id = config["configurable"].get("profile_id", DEFAULT_PROFILE_ID)
+    
     summary, summarized_count = get_summary_context(thread_id)
+    memory_context = notes_as_context_with_ids(profile_id)
 
     all_messages = state["messages"]
     tail_messages = all_messages[summarized_count:]
 
+    system_parts = []
+    if memory_context:
+        system_parts.append(memory_context)
     if summary:
-        system_msg = SystemMessage(
-            content=(
-                "Here is a summary of earlier parts of this conversation:\n\n"
-                f"{summary}\n\n"
-                "Use it for context, but respond only to the most recent message."
-            )
-        )
-        model_input = [system_msg] + tail_messages
-    else:
-        model_input = tail_messages
+        system_parts.append(f"Here is a summary of earlier parts of this conversation:\n\n{summary}\n\n Use it for context, but respond only to the most recent message.")
 
-    response = llm.invoke(model_input)
+    model_input = tail_messages
+    if system_parts:
+        system_msg = SystemMessage(content="\n\n---\n\n".join(system_parts))
+        model_input = [system_msg] + tail_messages
+
+    tools = build_memory_tools(profile_id, thread_id)
+    model_with_tools = llm.bind_tools(tools)
+    response = model_with_tools.invoke(model_input)
+
+
+    # if summary:
+    #     system_msg = SystemMessage(
+    #         content=(
+    #             "Here is a summary of earlier parts of this conversation:\n\n"
+    #             f"{summary}\n\n"
+    #             "Use it for context, but respond only to the most recent message."
+    #         )
+    #     )
+    #     model_input = [system_msg] + tail_messages
+    # else:
+    #     model_input = tail_messages
+
+    # response = llm.invoke(model_input)
     return {"messages": [response]}
 
 
+def tool_node(state: State, config: RunnableConfig):
+    """
+    Executes whatever tool call(s) the model just made. Not LangGraph's
+    prebuilt ToolNode, because our tools need per-turn profile_id/thread_id
+    context (see Chatbot/memory_tools.py's factory pattern) rather than a
+    fixed tool list bound once at graph-build time.
+    """
+    thread_id = config["configurable"]["thread_id"]
+    profile_id = config["configurable"].get("profile_id", DEFAULT_PROFILE_ID)
+
+    tools = build_memory_tools(profile_id, thread_id)
+    tools_by_name = {t.name: t for t in tools}
+
+    last_message = state["messages"][-1]
+    tool_messages = []
+    for call in last_message.tool_calls:
+        tool_fn = tools_by_name.get(call["name"])
+        if tool_fn is None:
+            result = f"Unknown tool: {call['name']}"
+        else:
+            result = tool_fn.invoke(call["args"])
+        tool_messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+
+    return {"messages": tool_messages}
 
 
 def should_summarize(state: State, config: RunnableConfig) -> str:
@@ -140,6 +189,19 @@ def should_summarize(state: State, config: RunnableConfig) -> str:
         return "summarize"
 
     return END
+
+
+def route_after_agent(state: State, config: RunnableConfig) -> str:
+    """
+    Single routing decision after the agent node runs: if it just made
+    tool calls, go execute them (and loop back to the agent afterward -
+    see build_graph). Otherwise, fall through to the existing Phase 2
+    summarization check.
+    """
+    last_message = state["messages"][-1]
+    if getattr(last_message, "tool_calls", None):
+        return "tools"
+    return should_summarize(state, config)
 
 
 def summarize_node(state: State, config: RunnableConfig):
@@ -200,14 +262,16 @@ def build_graph():
     """
     builder = StateGraph(State)
     builder.add_node("model", call_model)
+    builder.add_node("tools", tool_node)
     builder.add_node("summarize", summarize_node)
 
     builder.add_edge(START, "model")
     builder.add_conditional_edges(
         "model", 
-        should_summarize,
-        {"summarize": "summarize", END: END},
+        route_after_agent,
+        {"tools": "tools", "summarize": "summarize", END: END},
     )
+    builder.add_edge("tools", "model")
     builder.add_edge("summarize", END)
 
     conn = Connection.connect(get_conn_string(), autocommit=True)
@@ -219,7 +283,7 @@ def build_graph():
         with open("img/Phase3_graph.png", "wb") as f:
             f.write(png_bytes)
     except Exception as e:
-        print(f"Error occurred while generating graph: {e}")
+        print(f"Error occurreds while generating graph: {e}")
 
     return app
 

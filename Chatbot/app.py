@@ -19,6 +19,18 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import streamlit as st
 
+from DB.profiles import (
+    init_profiles_table,
+    create_profile,
+    list_profiles,
+    rename_profile,
+    delete_profile,
+    get_profile_name,
+    DEFAULT_PROFILE_ID,
+)
+from DB.long_term_memory import list_notes, delete_note
+
+
 from DB.chat_sessions import (
     init_chat_sessions_table,
     create_chat,
@@ -39,7 +51,7 @@ st.set_page_config(page_title="MemoryOS Chatbot", layout="wide")
 # ---------------------------------------------------------------------
 init_chat_sessions_table()
 init_summary_context_table()
-
+init_profiles_table()
 
 @st.cache_resource
 def get_graph():
@@ -63,11 +75,66 @@ if "active_thread_id" not in st.session_state:
 if "renaming_thread_id" not in st.session_state:
     st.session_state.renaming_thread_id = None
 
+if "active_profile_id" not in st.session_state:
+    st.session_state.active_profile_id = DEFAULT_PROFILE_ID
+
+if "renaming_profile_id" not in st.session_state:
+    st.session_state.renaming_profile_id = None
 
 # ---------------------------------------------------------------------
 # Sidebar: chat list + new/delete/rename controls
 # ---------------------------------------------------------------------
 with st.sidebar:
+    st.subheader("🧠 Profile")
+
+    profiles = list_profiles()
+    profile_labels = {p[0]: p[1] for p in profiles}  # profile_id -> name
+
+    selected_name = st.selectbox(
+        "Active profile",
+        options=list(profile_labels.keys()),
+        format_func=lambda pid: profile_labels[pid],
+        index=list(profile_labels.keys()).index(st.session_state.active_profile_id)
+        if st.session_state.active_profile_id in profile_labels else 0,
+        label_visibility="collapsed",
+    )
+    if selected_name != st.session_state.active_profile_id:
+        st.session_state.active_profile_id = selected_name
+        st.rerun()
+
+    pc1, pc2 = st.columns(2)
+    if pc1.button("➕ New", use_container_width=True, key="new_profile_btn"):
+        new_pid = create_profile("New Profile")
+        st.session_state.active_profile_id = new_pid
+        st.rerun()
+    if pc2.button("✏️ Rename", use_container_width=True, key="rename_profile_btn"):
+        st.session_state.renaming_profile_id = st.session_state.active_profile_id
+        st.rerun()
+
+    if st.session_state.renaming_profile_id == st.session_state.active_profile_id:
+        new_pname = st.text_input(
+            "New profile name",
+            value=profile_labels.get(st.session_state.active_profile_id, ""),
+            key="profile_rename_input",
+        )
+        if st.button("Save profile name", key="save_profile_name"):
+            rename_profile(st.session_state.active_profile_id, new_pname.strip() or "Untitled")
+            st.session_state.renaming_profile_id = None
+            st.rerun()
+
+    if st.session_state.active_profile_id != DEFAULT_PROFILE_ID:
+        if st.button("🗑️ Delete this profile", key="delete_profile_btn"):
+            delete_profile(st.session_state.active_profile_id)
+            st.session_state.active_profile_id = DEFAULT_PROFILE_ID
+            st.rerun()
+
+    st.caption(
+        "Long-term memory (facts the agent remembers about you) is scoped "
+        "to this profile, not to any single chat — it follows you across "
+        "every conversation."
+    )
+    st.divider()
+
     st.title("💬 Chats")
 
     if st.button("➕ New Chat", use_container_width=True):
@@ -132,7 +199,12 @@ with st.sidebar:
 # Main chat area
 # ---------------------------------------------------------------------
 active_thread_id = st.session_state.active_thread_id
-config = {"configurable": {"thread_id": active_thread_id}}
+config = {
+    "configurable": {
+        "thread_id": active_thread_id,
+        "profile_id": st.session_state.active_profile_id,   # NEW
+    }
+}
 
 st.title(get_chat_title(active_thread_id))
 
@@ -153,7 +225,24 @@ if current_summary:
             "Every message below is still fully preserved and shown as-is."
         )
 
+notes = list_notes(st.session_state.active_profile_id)
+if notes:
+    with st.expander(f"🧠 What I remember about you ({len(notes)} notes)", expanded=False):
+        for n in notes:
+            ncol1, ncol2 = st.columns([5, 1])
+            ncol1.write(f"• {n['text']}")
+            if ncol2.button("🗑️", key=f"del_note_{n['key']}"):
+                delete_note(st.session_state.active_profile_id, n['key'])
+                st.rerun()
+        st.caption(
+            "These notes were saved automatically by the agent, or when "
+            "you explicitly asked it to remember something. They apply to "
+            "every chat under this profile, not just this one."
+        )
+
 for msg in messages:
+    if msg.type == "tool":
+        continue   # NEW — tool results are internal, not conversational turns
     role = "user" if msg.type == "human" else "assistant"
     with st.chat_message(role):
         st.write(message_text(msg))
@@ -232,6 +321,8 @@ if user_text is not None:
                 if "model" in chunk:
                     final_response = chunk["model"]["messages"][-1]
                     status.markdown("_Thinking..._")
+                if "tools" in chunk:                                    
+                    status.markdown("🧠 _Checking/updating memory..._")  
                 if "summarize" in chunk:
                     summarized_this_turn = True
                     status.markdown("🧵 _Compacting older messages into summary..._")
