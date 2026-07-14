@@ -43,7 +43,7 @@ from DB.summary_context import get_summary_context, upsert_summary_context
 
 load_dotenv()
 
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:1b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 llm = ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.4)
@@ -127,20 +127,6 @@ def call_model(state: State, config: RunnableConfig):
     model_with_tools = llm.bind_tools(tools)
     response = model_with_tools.invoke(model_input)
 
-
-    # if summary:
-    #     system_msg = SystemMessage(
-    #         content=(
-    #             "Here is a summary of earlier parts of this conversation:\n\n"
-    #             f"{summary}\n\n"
-    #             "Use it for context, but respond only to the most recent message."
-    #         )
-    #     )
-    #     model_input = [system_msg] + tail_messages
-    # else:
-    #     model_input = tail_messages
-
-    # response = llm.invoke(model_input)
     return {"messages": [response]}
 
 

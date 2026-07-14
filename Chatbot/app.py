@@ -319,7 +319,9 @@ if user_text is not None:
                 {"messages": [human_msg]}, config, stream_mode="updates"
             ):
                 if "model" in chunk:
-                    final_response = chunk["model"]["messages"][-1]
+                    candidate = chunk["model"]["messages"][-1]
+                    if not getattr(candidate,"tool_calls",None):
+                        final_response = candidate 
                     status.markdown("_Thinking..._")
                 if "tools" in chunk:                                    
                     status.markdown("🧠 _Checking/updating memory..._")  
@@ -328,8 +330,11 @@ if user_text is not None:
                     status.markdown("🧵 _Compacting older messages into summary..._")
 
             status.empty()
-            if final_response is not None:
+            if final_response is not None and message_text(final_response).strip():
                 response_box.write(message_text(final_response))
+            else:
+                response_box.write("_(No text response — check the console/logs; the model may have only called a tool.)_")
+                
             if summarized_this_turn:
                 st.info(
                     "🧵 Older messages were just folded into the running "
