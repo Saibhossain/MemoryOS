@@ -21,8 +21,8 @@ It creates:
 """
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.store.postgres import PostgresStore
-
-from DB.connection import get_conn_string
+from DB.connection import get_conn_string, get_pool
+from DB.users import init_users_table
 from DB.chat_sessions import init_chat_sessions_table
 from DB.summary_context import init_summary_context_table
 from DB.profiles import init_profiles_table
@@ -36,6 +36,17 @@ with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
 with PostgresStore.from_conn_string(DB_URI) as store:
     store.setup()
     print("✅ store tables ready (store, store_migrations) - now used by Phase 3 long-term memory")
+
+# Initialize users table first
+init_users_table()
+print("✅ users table ready")
+
+# Run migrations to ensure columns exist in existing db
+pool = get_pool()
+with pool.connection() as conn:
+    conn.execute("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT 'default_user';")
+    conn.execute("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS username TEXT NOT NULL DEFAULT 'default_user';")
+print("✅ migrations checked (username columns verified)")
 
 init_chat_sessions_table()
 print("✅ chat_sessions table ready")

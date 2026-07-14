@@ -24,7 +24,8 @@ def init_profiles_table():
                 profile_id  TEXT PRIMARY KEY,
                 name        TEXT NOT NULL DEFAULT 'Default',
                 created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                username    TEXT NOT NULL DEFAULT 'default_user'
             );
             """
         )
@@ -42,24 +43,24 @@ def _ensure_default_profile():
     with pool.connection() as conn:
         conn.execute(
             """
-            INSERT INTO profiles (profile_id, name)
-            VALUES (%s, 'Default')
+            INSERT INTO profiles (profile_id, name, username)
+            VALUES (%s, 'Default', 'default_user')
             ON CONFLICT (profile_id) DO NOTHING;
             """,
             (DEFAULT_PROFILE_ID,),
         )
 
-def create_profile(name: str = "New Profile") -> str:
+def create_profile(username: str, name: str = "New Profile") -> str:
     profile_id = str(uuid.uuid4())
     pool = get_pool()
     with pool.connection() as conn:
         conn.execute(
-            "INSERT INTO profiles (profile_id, name) VALUES (%s, %s)",
-            (profile_id, name),
+            "INSERT INTO profiles (profile_id, name, username) VALUES (%s, %s, %s)",
+            (profile_id, name, username),
         )
     return profile_id
 
-def list_profiles():
+def list_profiles(username: str):
     """Returns rows: (profile_id, name, created_at, updated_at)"""
     pool = get_pool()
     with pool.connection() as conn:
@@ -67,8 +68,10 @@ def list_profiles():
             """
             SELECT profile_id, name, created_at, updated_at
             FROM profiles
+            WHERE username = %s
             ORDER BY updated_at DESC
-            """
+            """,
+            (username,),
         ).fetchall()
     return rows
 
@@ -98,21 +101,41 @@ def touch_profile(profile_id: str):
             (profile_id,),
         )
 
-def delete_profile(profile_id: str):
+def delete_profile(profile_id: str, username: str):
     """
     Deletes the profile row and all its long-term memory notes from the
-    `store` table. Refuses to delete the default profile - the app always
-    needs at least one profile to fall back to.
+    `store` table. Refuses to delete the last remaining profile of the user.
     """
-    if profile_id == DEFAULT_PROFILE_ID:
-        raise ValueError("The default profile cannot be deleted.")
-
     pool = get_pool()
     with pool.connection() as conn:
-        # store table's namespace column stores (profile_id, "notes") as
-        # a Postgres array/path - filtering on the first element.
+        count = conn.execute(
+            "SELECT COUNT(*) FROM profiles WHERE username = %s", (username,)
+        ).fetchone()[0]
+        if count <= 1:
+            raise ValueError("You must keep at least one profile.")
+
         conn.execute(
             "DELETE FROM store WHERE prefix[1] = %s", (profile_id,)
         )
-        conn.execute("DELETE FROM profiles WHERE profile_id = %s", (profile_id,))
+        conn.execute("DELETE FROM profiles WHERE profile_id = %s AND username = %s", (profile_id, username))
+
+def ensure_user_has_profile(username: str) -> str:
+    """Ensures the user has at least one profile. Returns the active profile ID."""
+    username = username.strip().lower()
+    pool = get_pool()
+    with pool.connection() as conn:
+        row = conn.execute(
+            "SELECT profile_id FROM profiles WHERE username = %s LIMIT 1",
+            (username,)
+        ).fetchone()
+        if row:
+            return row[0]
+        
+        # If no profile, create a default one for this user
+        profile_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO profiles (profile_id, name, username) VALUES (%s, 'Default', %s)",
+            (profile_id, username),
+        )
+        return profile_id
 

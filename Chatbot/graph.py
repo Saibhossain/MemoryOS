@@ -46,7 +46,10 @@ load_dotenv()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
-llm = ChatOllama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.4)
+def get_llm(model_name: str = None) -> ChatOllama:
+    model = model_name or os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    return ChatOllama(model=model, base_url=base_url, temperature=0.4)
 
 TOKEN_THRESHOLD = 3000  # If the message history exceeds this many tokens, summarize it
 MESSAGE_COUNT_FALLBACK = 20 # If we can't get a token count, fall back to this many messages
@@ -63,16 +66,38 @@ def estimate_tokens(messages) -> int:
 
     return total_chars // 4 # Roughly 4 chars per token
 
-def describe_image(image_bytes: bytes, mime: str = "image/png") -> str:
-    """
-    One-off vision call, deliberately NOT a graph node - it runs before a
-    HumanMessage is even constructed, so its output (text) is what gets
-    persisted, never the image itself.
+def list_local_ollama_models():
+    import urllib.request
+    import json
+    try:
+        base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        req = urllib.request.Request(f"{base_url}/api/tags")
+        with urllib.request.urlopen(req, timeout=2.0) as response:
+            data = json.loads(response.read().decode())
+            return [m["name"] for m in data.get("models", [])]
+    except Exception:
+        pass
+    return []
 
-    Requires a vision-capable Ollama model (qwen2.5vl, llava, etc). If
-    OLLAMA_MODEL is text-only, this will raise - the caller (app.py)
-    should catch that and fall back gracefully.
+def is_vision_model(model_name: str) -> bool:
+    name_lower = model_name.lower()
+    return any(kw in name_lower for kw in ["vl", "llava", "vision", "bakllava", "minicpm-v", "mllama", "cogvlm"])
+
+def describe_image(image_bytes: bytes, mime: str = "image/png", model_name: str = None) -> str:
     """
+    One-off vision call. If the selected model is not vision-capable,
+    we scan local models and auto-select a vision-capable one (like qwen2.5vl).
+    """
+    active_model = model_name or os.getenv("OLLAMA_MODEL", "qwen3:1.7b")
+    
+    # Auto-fallback to OCR/Vision model if active model is not vision-capable
+    if not is_vision_model(active_model):
+        local_models = list_local_ollama_models()
+        for m in local_models:
+            if is_vision_model(m):
+                active_model = m
+                break
+
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     vision_message = HumanMessage(
         content=[
@@ -88,8 +113,50 @@ def describe_image(image_bytes: bytes, mime: str = "image/png") -> str:
             {"type": "image_url", "image_url": f"data:{mime};base64,{b64}"},
         ]
     )
-    response = llm.invoke([vision_message])
+    model = get_llm(active_model)
+    response = model.invoke([vision_message])
     return response.content
+
+
+def extract_memory_without_tools(model, conversation_input, assistant_response, profile_id, thread_id):
+    """
+    Fallback memory extraction for models that do not support tool calling.
+    Analyzes the user message and assistant response to extract and save facts.
+    """
+    try:
+        last_human = None
+        for msg in reversed(conversation_input):
+            if msg.type == "human":
+                last_human = msg.content
+                break
+        
+        if not last_human:
+            return
+
+        prompt = (
+            "You are a memory extraction assistant.\n"
+            "Analyze the user's statement and the assistant's response, and extract any new, durable facts, preferences, or instructions "
+            "about the user that should be remembered for future conversations (e.g. user's name, job, likes, dislikes, interests).\n"
+            "Do not extract temporary conversation state or sensitive credentials.\n\n"
+            f"User Statement: {last_human}\n"
+            f"Assistant Response: {assistant_response}\n\n"
+            "Return only the extracted facts as short bullet points (starting with '- '), one per line. "
+            "Do not include any headers or introductory text. If there are no new facts to remember, return only the word 'NONE'."
+        )
+        
+        extraction = model.invoke(prompt).content.strip()
+        if extraction and extraction != "NONE":
+            from DB.long_term_memory import add_note
+            from DB.profiles import touch_profile
+            for line in extraction.split("\n"):
+                line = line.strip()
+                if line.startswith("- "):
+                    note = line[2:].strip()
+                    if note:
+                        add_note(profile_id, note, source_thread_id=thread_id)
+            touch_profile(profile_id)
+    except Exception as e:
+        print(f"Fallback memory extraction failed: {e}")
 
 
 def call_model(state: State, config: RunnableConfig):
@@ -99,12 +166,12 @@ def call_model(state: State, config: RunnableConfig):
     graph state. `messages` in state itself is always the FULL history;
     we just don't send all of it to the LLM every turn.
 
-    Phase 3 long-term memory notes for the active profile. Tools are
-    rebuilt and rebound every call so profile-switching mid-session works
-    correctly - see Chatbot/memory_tools.py for why.
+    If the model doesn't support tools, falls back to text execution and
+    extracts memories via system prompt.
     """
     thread_id = config["configurable"]["thread_id"]
     profile_id = config["configurable"].get("profile_id", DEFAULT_PROFILE_ID)
+    model_name = config["configurable"].get("model")
     
     summary, summarized_count = get_summary_context(thread_id)
     memory_context = notes_as_context_with_ids(profile_id)
@@ -124,8 +191,15 @@ def call_model(state: State, config: RunnableConfig):
         model_input = [system_msg] + tail_messages
 
     tools = build_memory_tools(profile_id, thread_id)
-    model_with_tools = llm.bind_tools(tools)
-    response = model_with_tools.invoke(model_input)
+    model = get_llm(model_name)
+    
+    try:
+        model_with_tools = model.bind_tools(tools)
+        response = model_with_tools.invoke(model_input)
+    except Exception as e:
+        print(f"Tool binding/call failed: {e}. Falling back to non-tool execution.")
+        response = model.invoke(model_input)
+        extract_memory_without_tools(model, model_input, response.content, profile_id, thread_id)
 
     return {"messages": [response]}
 
@@ -228,7 +302,9 @@ def summarize_node(state: State, config: RunnableConfig):
             "Return only the summary text, nothing else."
         )
 
-    new_summary = llm.invoke(prompt).content
+    model_name = config["configurable"].get("model")
+    model = get_llm(model_name)
+    new_summary = model.invoke(prompt).content
     new_summarized_count = summarized_count + len(foldable)
 
     upsert_summary_context(thread_id, new_summary, new_summarized_count)

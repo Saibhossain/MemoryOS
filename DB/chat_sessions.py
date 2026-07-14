@@ -23,7 +23,8 @@ def init_chat_sessions_table():
                 title          TEXT NOT NULL DEFAULT 'New Chat',
                 created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-                message_count  INTEGER NOT NULL DEFAULT 0
+                message_count  INTEGER NOT NULL DEFAULT 0,
+                username       TEXT NOT NULL DEFAULT 'default_user'
             );
             """
         )
@@ -33,18 +34,18 @@ def init_chat_sessions_table():
         )
 
 
-def create_chat(title: str = "New Chat") -> str:
+def create_chat(username: str, title: str = "New Chat") -> str:
     thread_id = str(uuid.uuid4())
     pool = get_pool()
     with pool.connection() as conn:
         conn.execute(
-            "INSERT INTO chat_sessions (thread_id, title) VALUES (%s, %s)",
-            (thread_id, title),
+            "INSERT INTO chat_sessions (thread_id, title, username) VALUES (%s, %s, %s)",
+            (thread_id, title, username),
         )
     return thread_id
 
 
-def list_chats():
+def list_chats(username: str):
     """Returns rows: (thread_id, title, created_at, updated_at, message_count)"""
     pool = get_pool()
     with pool.connection() as conn:
@@ -52,8 +53,10 @@ def list_chats():
             """
             SELECT thread_id, title, created_at, updated_at, message_count
             FROM chat_sessions
+            WHERE username = %s
             ORDER BY updated_at DESC
-            """
+            """,
+            (username,),
         ).fetchall()
     return rows
 
