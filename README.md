@@ -50,21 +50,21 @@ This repository acts as an interactive playground to study the core concepts of 
 ```bash
 MemoryOS/
 ├── Chatbot/
-│   ├── app.py           # Main Streamlit chat UI (login, model selector, inline editing, popover uploader)
-│   ├── graph.py         # LangGraph state machine, dynamic Ollama model setup, and fallback vision logic
-│   ├── init_db.py       # Database schema initialization and column migration script
-│   ├── utils.py         # Image preprocessing and message conversion helpers
-│   └── memory_tools.py  # Factories for LLM tools (add_memory, forget_memory)
+│   ├── app.py             # Main Streamlit chat UI (login, model selector, inline editing, popover uploader)
+│   ├── graph.py           # LangGraph state machine, dynamic Ollama model setup, and fallback vision logic
+│   ├── init_db.py         # Database schema initialization and column migration script
+│   ├── utils.py           # Image preprocessing and message conversion helpers
+│   └── memory_tools.py    # Factories for LLM tools (add_memory, forget_memory)
 ├── DB/
-│   ├── connection.py    # Database connection pool settings (psycopg_pool)
-│   ├── chat_sessions.py # Scoped conversation metadata management
-│   ├── profiles.py      # Profile lifecycle and memory scoping operations
-│   ├── users.py         # Authentication table setup and hashing functions
-│   ├── summary_context.py# Thread summaries outside checkpointer state
-│   └── monitor_app.py   # Multi-user analytics monitor dashboard (Plotly, system metrics)
-├── .env                 # Database URI and Ollama model environment variables
-├── requirements.txt     # Python package requirements
-└── README.md            # This documentation
+│   ├── connection.py      # Database connection pool settings (psycopg_pool)
+│   ├── chat_sessions.py   # Scoped conversation metadata management
+│   ├── profiles.py        # Profile lifecycle and memory scoping operations
+│   ├── users.py           # Authentication table setup and hashing functions
+│   ├── summary_context.py # Thread summaries outside checkpointer state
+│   └── monitor_app.py     # Multi-user analytics monitor dashboard (Plotly, system metrics)
+├── .env                   # Database URI and Ollama model environment variables
+├── requirements.txt       # Python package requirements
+└── README.md              # This documentation
 ```
 
 ---
