@@ -9,7 +9,7 @@ MemoryOS is a fully local, multi-user educational sandbox application designed t
 ## 📸 Screenshots
 
 **User Login Page**  
-<img src="img/1.png" alt="User Login Page" width="900"/>
+<img src="img/1.png" alt="User Login Page" width="950"/>
 
 <br>
 
