@@ -6,6 +6,23 @@ MemoryOS is a fully local, multi-user educational sandbox application designed t
 
 ---
 
+## 📸 Screenshots
+
+**User Login Page**  
+<img src="img/1.png" alt="User Login Page" width="600"/>
+
+<br>
+
+**Short-Term Memory**  
+<img src="img/2.png" alt="Specific Memory" width="600"/>
+
+<br>
+
+**Long-Term Memory**  
+<img src="img/3.png" alt="Long Term Memory" width="600"/>
+
+---
+
 ## 💡 What You Will Learn
 
 This repository acts as an interactive playground to study the core concepts of memory representation in modern LLM applications:
